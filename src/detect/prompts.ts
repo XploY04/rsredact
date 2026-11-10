@@ -48,6 +48,47 @@ ${transcript}
 </page_text>${links}`;
 }
 
+/**
+ * The schemas take the requested target ids as an enum, so a reply can only
+ * name a target that was asked for. A free-text target ends up in the audit
+ * record, in logs, and in HTTP headers, so it must never carry page text.
+ */
+export function textSchema(targetIds: string[]) {
+  return {
+    ...TEXT_SCHEMA,
+    schema: withTargetEnum(TEXT_SCHEMA.schema, targetIds),
+  };
+}
+
+export function visionSchema(targetIds: string[]) {
+  return {
+    ...VISION_SCHEMA,
+    schema: withTargetEnum(VISION_SCHEMA.schema, targetIds),
+  };
+}
+
+function withTargetEnum(
+  schema: typeof TEXT_SCHEMA.schema | typeof VISION_SCHEMA.schema,
+  targetIds: string[],
+): Record<string, unknown> {
+  const items = schema.properties.redactions.items;
+  return {
+    ...schema,
+    properties: {
+      redactions: {
+        ...schema.properties.redactions,
+        items: {
+          ...items,
+          properties: {
+            ...items.properties,
+            target: { type: 'string', enum: targetIds, description: 'Which target this is.' },
+          },
+        },
+      },
+    },
+  };
+}
+
 export const TEXT_SCHEMA = {
   name: 'cv_text_redactions',
   description: 'Substrings on a CV page that must be redacted.',

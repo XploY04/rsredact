@@ -11,12 +11,33 @@
 const EXPLICIT = /\b(?:https?:\/\/|www\.)[^\s<>"')\]]+/gi;
 
 /**
+ * Tokens that are spelled like a domain but are a framework, a tool, or a
+ * degree. Each is real CV content, and ".NET" and ".IO" are real top-level
+ * domains, so they need naming one by one.
+ */
+const NOT_DOMAINS = [
+  'asp\\.net',
+  'vb\\.net',
+  'ado\\.net',
+  'ml\\.net',
+  'akka\\.net',
+  'entity\\.net',
+  'socket\\.io',
+  'draw\\.io',
+  '[bm]\\.tech',
+  '[bm]\\.com',
+];
+const NOT_A_DOMAIN = `(?!(?:${NOT_DOMAINS.join('|')})(?![\\w-]))`;
+
+/**
  * A bare domain followed by a path: the slash is what makes it unambiguous.
  * The lookbehind keeps this from firing on the host half of an email address,
  * which the email target already covers in full.
  */
-const WITH_PATH =
-  /(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}\/[^\s<>"')\]]*/gi;
+const WITH_PATH = new RegExp(
+  `(?<![@\\w.-])${NOT_A_DOMAIN}(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,}\\/[^\\s<>"')\\]]*`,
+  'gi',
+);
 
 /**
  * A bare domain with no path is genuinely ambiguous: "Node.js", "Next.js" and
@@ -59,7 +80,7 @@ const BARE_TLDS = [
 ];
 
 const BARE_DOMAIN = new RegExp(
-  `(?<![@\\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${BARE_TLDS.join('|')})\\b`,
+  `(?<![@\\w.-])${NOT_A_DOMAIN}(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${BARE_TLDS.join('|')})\\b`,
   'gi',
 );
 

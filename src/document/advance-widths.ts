@@ -21,13 +21,29 @@ function context(): SKRSContext2D {
   return measurer;
 }
 
-/** Maps an embedded PDF font name onto a font class the measurer has. */
-export function proxyFamily(fontName: string | undefined): string {
+type FontClass = 'sans-serif' | 'serif' | 'monospace';
+
+/**
+ * Maps a font family, either pdf.js's resolved class ("sans-serif", "serif",
+ * "monospace") or an embedded font name, onto a broad class.
+ */
+export function proxyFamily(fontName: string | undefined): FontClass {
   const name = (fontName ?? '').toLowerCase();
   if (/mono|courier|consol/.test(name)) return 'monospace';
+  if (/sans|arial|helvetica/.test(name)) return 'sans-serif';
   if (/times|serif|georgia|garamond|book|minion|cambria/.test(name)) return 'serif';
   return 'sans-serif';
 }
+
+/**
+ * Liberation is named first because a generic family is not reliable: in a
+ * container with only Liberation installed, every generic family resolved to
+ * the same face, so serif and sans text were measured alike.
+ */
+const MEASURING_FONT: Record<Exclude<FontClass, 'monospace'>, string> = {
+  'sans-serif': '"Liberation Sans", sans-serif',
+  serif: '"Liberation Serif", serif',
+};
 
 const cache = new Map<string, number[]>();
 
@@ -44,13 +60,18 @@ export function apportion(
   if (text.length === 0) return [];
 
   const family = proxyFamily(fontName);
+  // Every character in a monospace font has the same advance, so an even split
+  // is exact and needs no font. Measuring one instead drifted by a character
+  // wherever "monospace" resolved to a proportional face.
+  if (family === 'monospace') return new Array<number>(text.length).fill(totalWidth / text.length);
+
   const key = `${family} ${text}`;
   let relative = cache.get(key);
 
   if (!relative) {
     const ctx = context();
     // Measured at a fixed size and scaled later, so the cache is size-independent.
-    ctx.font = `100px ${family}`;
+    ctx.font = `100px ${MEASURING_FONT[family]}`;
     relative = [...text].map((char) => ctx.measureText(char).width);
     if (cache.size > 4096) cache.clear();
     cache.set(key, relative);

@@ -2,7 +2,7 @@ import type { Detection, LLMProvider, Page, ResolvedTarget } from '../types.js';
 import { ProviderError } from '../errors.js';
 import { buildLines, unionBox, wordsInRange, type LineText } from './lines.js';
 import { describeLinks } from './link-context.js';
-import { TEXT_SCHEMA, TEXT_SYSTEM, textPrompt } from './prompts.js';
+import { TEXT_SYSTEM, textPrompt, textSchema } from './prompts.js';
 
 /** Characters of transcript per request. CV pages are far below this. */
 const MAX_CHUNK_CHARS = 12_000;
@@ -40,6 +40,8 @@ export async function detectWithText(
   const detections: Detection[] = [];
   const warnings: string[] = [];
   const linkSection = describeLinks(page);
+  const targetIds = textTargets.map((t) => t.id);
+  const schema = textSchema(targetIds);
   let calls = 0;
 
   for (const chunk of chunkLines(lines)) {
@@ -59,7 +61,7 @@ export async function detectWithText(
       response = await provider.generateJson({
         system: TEXT_SYSTEM,
         prompt,
-        schema: TEXT_SCHEMA as never,
+        schema: schema as never,
         maxTokens: 8192,
       });
       calls++;
@@ -74,6 +76,11 @@ export async function detectWithText(
     for (const item of response.redactions ?? []) {
       const quote = item.quote?.trim();
       if (!quote) continue;
+      // The schema forbids it, but a provider without strict schemas can still do it.
+      if (!targetIds.includes(item.target)) {
+        warnings.push(`page ${page.index + 1}: dropped a finding for a target that was not requested`);
+        continue;
+      }
 
       const matches = locate(lines, item.line, quote);
       if (matches.length === 0) {
@@ -89,7 +96,7 @@ export async function detectWithText(
         if (words.length === 0) continue;
         detections.push({
           page: page.index,
-          target: item.target || 'unknown',
+          target: item.target,
           box: unionBox(words.map((w) => w.box)),
           text: quote,
           confidence: clamp(item.confidence),

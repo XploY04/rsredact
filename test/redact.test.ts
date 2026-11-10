@@ -6,6 +6,9 @@ import { redact } from '../src/index.js';
 import { scriptedProvider } from '../src/providers/index.js';
 import { buildSampleCv } from './fixture.js';
 import { TEXT_SYSTEM } from '../src/detect/prompts.js';
+import { degrees, PDFString } from 'pdf-lib';
+import { RedactError } from '../src/errors.js';
+import { addLink, buildPdf, centreOf, PAGE, splitProvider, textPng, type PointRect } from './pdfs.js';
 
 const DPI = 150;
 const POINTS_PER_INCH = 72;
@@ -374,3 +377,193 @@ test('digits inside a URL are not mistaken for a phone number', async () => {
   }
 });
 
+
+/** Share of pixels in a raster rectangle darker than mid-grey. */
+async function darkFraction(png: Buffer, box: { x: number; y: number; width: number; height: number }): Promise<number> {
+  const image = await loadImage(png);
+  const canvas = createCanvas(image.width, image.height);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, 0, 0);
+  const data = ctx.getImageData(Math.round(box.x), Math.round(box.y), Math.round(box.width), Math.round(box.height)).data;
+  let dark = 0;
+  for (let i = 0; i < data.length; i += 4) if (data[i]! < 128) dark++;
+  return dark / (data.length / 4);
+}
+
+function rasterBox(rect: PointRect, dpi = DPI) {
+  const scale = dpi / POINTS_PER_INCH;
+  return {
+    x: rect.x * scale,
+    y: (PAGE.height - rect.y - rect.height) * scale,
+    width: rect.width * scale,
+    height: rect.height * scale,
+  };
+}
+
+test('redact-identifying keeps employer, certification and project link text', async () => {
+  const lines: [string, string][] = [
+    ['Stripe', 'https://stripe.com'],
+    ['AWS Certified Solutions Architect', 'https://www.credly.com/badges/abc'],
+    ['Kubernetes Operator for Postgres', 'https://github.com/acme/pg-operator'],
+    ['Embeddings Co', 'https://www.linkedin.com/company/embeddings-co'],
+    ['LinkedIn', 'https://www.linkedin.com/in/jane-doe-1a2b'],
+    ['GitHub', 'https://github.com/janedoe'],
+    ['Write to me', 'mailto:jane@example.com'],
+    ['Call me', 'tel:+919876543210'],
+  ];
+  const bytes = await buildPdf((canvas) => {
+    lines.forEach(([text, url], i) => {
+      const y = 700 - i * 20;
+      canvas.page.drawText(text, { x: 60, y, size: 10, font: canvas.helvetica });
+      addLink(canvas, { x: 58, y: y - 2, width: canvas.helvetica.widthOfTextAtSize(text, 10) + 4, height: 12 }, url);
+    });
+  });
+
+  const result = await redact(bytes, {
+    targets: ['email', 'phone', 'social', 'url'],
+    mode: 'patterns-only',
+    linkText: 'redact-identifying',
+  });
+  const hidden = result.detections.filter((d) => d.source === 'link').map((d) => d.text).sort();
+  assert.deepEqual(hidden, [
+    'https://github.com/janedoe',
+    'https://www.linkedin.com/in/jane-doe-1a2b',
+    'mailto:jane@example.com',
+    'tel:+919876543210',
+  ]);
+});
+
+test('framework and degree names are not mistaken for domains', async () => {
+  const { bytes } = await buildSampleCv({
+    extraLine: 'ASP.NET Core, VB.NET, Socket.IO, ASP.NET/C#, draw.io, B.Tech, M.Tech, B.Com',
+  });
+  const result = await redact(bytes, { targets: ['url'], mode: 'patterns-only' });
+  assert.deepEqual(result.detections.map((d) => d.text), []);
+});
+
+test('an email set in Courier is covered from its first letter', async () => {
+  const lines = ['Contact Me At: filip.jillian@lilly.com', 'Email: lalit.tiwari@iitj.ac.in'];
+  const bytes = await buildPdf((canvas) => {
+    lines.forEach((text, i) => canvas.page.drawText(text, { x: 60, y: 700 - i * 20, size: 10, font: canvas.courier }));
+  });
+  const result = await redact(bytes, {
+    targets: ['email'],
+    mode: 'patterns-only',
+    style: 'box',
+    output: 'images',
+  });
+
+  // Courier advances 0.6 em per character, so the first letter of each address
+  // sits at a known offset from the start of the line.
+  for (const [i, text] of lines.entries()) {
+    const firstLetter = text.indexOf(':') + 2;
+    const x = 60 + (firstLetter + 0.5) * 6;
+    const pixel = await samplePixel(result.images![0]!, (x * DPI) / POINTS_PER_INCH, ((PAGE.height - 700 + i * 20 - 3) * DPI) / POINTS_PER_INCH);
+    assert.deepEqual(pixel, [0, 0, 0], `the first letter of line ${i + 1} is still visible`);
+  }
+});
+
+test('rotated text is boxed along its rotation', async () => {
+  const bytes = await buildPdf((canvas) => {
+    canvas.page.drawText('jane.doe@example.com', { x: 40, y: 400, size: 12, font: canvas.helvetica, rotate: degrees(90) });
+  });
+  const result = await redact(bytes, { targets: ['email'], mode: 'patterns-only', style: 'box', output: 'images' });
+
+  const email = result.detections.find((d) => d.target === 'email');
+  assert.ok(email, 'the rotated email was not detected');
+  assert.ok(email.box.height > email.box.width * 4, 'the box was laid out horizontally');
+
+  // The 20-character address runs about 120pt up the page from its origin.
+  const column = rasterBox({ x: 31, y: 402, width: 8, height: 120 });
+  assert.ok((await darkFraction(result.images![0]!, column)) > 0.95, 'the rotated email is still showing');
+});
+
+test('contact details in an image are found by vision and covered', async () => {
+  const picture: PointRect = { x: 60, y: 500, width: 300, height: 30 };
+  const bytes = await buildPdf(async (canvas) => {
+    canvas.page.drawText('Senior Engineer', { x: 60, y: 750, size: 12, font: canvas.helvetica });
+    const image = await canvas.pdf.embedPng(textPng('img.person@example.com', 600, 60));
+    canvas.page.drawImage(image, picture);
+  });
+  const provider = splitProvider([{ target: 'email', rect: picture }]);
+
+  const result = await redact(bytes, {
+    targets: ['email', 'phone'],
+    mode: 'text',
+    opaqueContent: 'vision',
+    provider,
+    style: 'box',
+    output: 'images',
+  });
+  assert.equal(result.audit.llmCalls, 2);
+  assert.equal(provider.requests.filter((r) => r.images?.length).length, 1);
+  assert.ok((await darkFraction(result.images![0]!, rasterBox(picture))) > 0.95, 'the image was left readable');
+  // The vision finding is clipped to the image, so the name above it stays.
+  assert.ok((await darkFraction(result.images![0]!, rasterBox({ x: 60, y: 780, width: 80, height: 14 }))) < 0.5);
+});
+
+test('a form field and a FreeText annotation send the page through vision', async () => {
+  const field: PointRect = { x: 60, y: 450, width: 250, height: 20 };
+  const bytes = await buildPdf((canvas) => {
+    canvas.page.drawText('Senior Engineer', { x: 60, y: 750, size: 12, font: canvas.helvetica });
+    const text = canvas.pdf.getForm().createTextField('contact');
+    text.setText('field.person@example.com');
+    text.addToPage(canvas.page, field);
+  });
+  const provider = splitProvider([{ target: 'email', rect: { x: 100, y: 455, width: 40, height: 10 } }]);
+  const result = await redact(bytes, {
+    targets: ['email'],
+    mode: 'text',
+    opaqueContent: 'vision',
+    provider,
+    style: 'box',
+    output: 'images',
+  });
+  assert.equal(result.audit.llmCalls, 2);
+  // A field holds one value, so a hit anywhere in it covers all of it.
+  assert.ok((await darkFraction(result.images![0]!, rasterBox(field))) > 0.95, 'the form field was left readable');
+
+  const freeText = await buildPdf((canvas) => {
+    canvas.page.drawText('Senior Engineer', { x: 60, y: 750, size: 12, font: canvas.helvetica });
+    canvas.annotations.push(
+      canvas.pdf.context.register(
+        canvas.pdf.context.obj({
+          Type: 'Annot',
+          Subtype: 'FreeText',
+          Rect: [60, 400, 320, 420],
+          Contents: PDFString.of('free.person@example.com'),
+          DA: PDFString.of('/Helv 10 Tf 0 g'),
+        }),
+      ),
+    );
+  });
+  const second = splitProvider([]);
+  const freeResult = await redact(freeText, { targets: ['email'], mode: 'text', opaqueContent: 'vision', provider: second });
+  assert.equal(freeResult.audit.llmCalls, 2);
+});
+
+test('icons do not send a page through vision, and no vision support is an error', async () => {
+  const withIcon = await buildPdf(async (canvas) => {
+    canvas.page.drawText('jane@example.com', { x: 80, y: 700, size: 10, font: canvas.helvetica });
+    canvas.page.drawImage(await canvas.pdf.embedPng(textPng('@', 40, 40)), { x: 60, y: 698, width: 12, height: 12 });
+  });
+  const provider = splitProvider([]);
+  const result = await redact(withIcon, { targets: ['email'], mode: 'text', opaqueContent: 'vision', provider });
+  assert.equal(result.audit.llmCalls, 1);
+
+  const withImage = await buildPdf(async (canvas) => {
+    canvas.page.drawText('Senior Engineer', { x: 60, y: 750, size: 12, font: canvas.helvetica });
+    canvas.page.drawImage(await canvas.pdf.embedPng(textPng('img.person@example.com', 600, 60)), {
+      x: 60, y: 500, width: 300, height: 30,
+    });
+  });
+  await assert.rejects(
+    redact(withImage, {
+      targets: ['email'],
+      mode: 'text',
+      opaqueContent: 'vision',
+      provider: splitProvider([], { supportsVision: false }),
+    }),
+    (error) => error instanceof RedactError && error.code === 'VISION_UNAVAILABLE',
+  );
+});

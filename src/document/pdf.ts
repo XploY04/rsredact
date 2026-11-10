@@ -1,11 +1,13 @@
 import {
+  AnnotationMode,
   GlobalWorkerOptions,
   getDocument,
+  OPS,
   Util,
   type PDFPageProxy,
 } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type { TextItem } from 'pdfjs-dist/types/src/display/api.js';
-import type { Box, Page, PageLink, Word } from '../types.js';
+import type { Box, OpaqueRegion, Page, PageLink, Word } from '../types.js';
 import { createRequire } from 'node:module';
 import { NapiCanvasFactory } from './canvas-factory.js';
 import { apportion } from './advance-widths.js';
@@ -117,7 +119,12 @@ export async function loadPdf(
       await page.render({ canvasContext: target.context as never, viewport }).promise;
       const image = target.canvas.toBuffer('image/png');
       const words = await extractWords(page, viewport.transform, i - 1);
-      const links = await extractLinks(page, viewport.transform);
+      const annotations = (await page.getAnnotations({ intent: 'display' })) as Record<string, unknown>[];
+      const links = extractLinks(annotations, viewport.transform);
+      const opaque = [
+        ...(await extractImages(page, viewport.transform)),
+        ...extractPaintedAnnotations(annotations, viewport.transform),
+      ];
       factory.destroy(target);
 
       pages.push({
@@ -128,6 +135,7 @@ export async function loadPdf(
         words,
         textSource: words.length > 0 ? 'pdf-text-layer' : 'none',
         links,
+        opaque,
       });
       page.cleanup();
     }
@@ -145,29 +153,126 @@ export async function loadPdf(
  * exists to remove. The annotation rects are in the same coordinate space as
  * the text, so they need no separate localisation.
  */
-async function extractLinks(page: PDFPageProxy, viewportTransform: number[]): Promise<PageLink[]> {
-  const annotations = await page.getAnnotations({ intent: 'display' });
+function extractLinks(annotations: Record<string, unknown>[], viewportTransform: number[]): PageLink[] {
   const links: PageLink[] = [];
 
-  for (const annotation of annotations as Record<string, unknown>[]) {
+  for (const annotation of annotations) {
     if (annotation.subtype !== 'Link') continue;
     const url = (annotation.url ?? annotation.unsafeUrl) as string | undefined;
     const rect = annotation.rect as number[] | undefined;
     if (!url || !rect || rect.length < 4) continue;
-
-    const [x0, y0] = Util.applyTransform([rect[0]!, rect[1]!], viewportTransform);
-    const [x1, y1] = Util.applyTransform([rect[2]!, rect[3]!], viewportTransform);
-    links.push({
-      url,
-      box: {
-        x: Math.min(x0!, x1!),
-        y: Math.min(y0!, y1!),
-        width: Math.abs(x1! - x0!),
-        height: Math.abs(y1! - y0!),
-      },
-    });
+    links.push({ url, box: rectToBox(rect, viewportTransform) });
   }
   return links;
+}
+
+/** Annotation flags that keep an annotation off the rendered page. */
+const HIDDEN = 2;
+const NO_VIEW = 32;
+
+/**
+ * Form fields and annotations such as FreeText are painted onto the page but
+ * are not in its text layer, so text detection cannot see what they say. Links
+ * are excluded because they paint nothing, and popups because they only open
+ * in a viewer.
+ */
+function extractPaintedAnnotations(
+  annotations: Record<string, unknown>[],
+  viewportTransform: number[],
+): OpaqueRegion[] {
+  const regions: OpaqueRegion[] = [];
+  for (const annotation of annotations) {
+    if (annotation.subtype === 'Link' || annotation.subtype === 'Popup') continue;
+    const flags = Number(annotation.annotationFlags ?? 0);
+    if (flags & (HIDDEN | NO_VIEW)) continue;
+    const rect = annotation.rect as number[] | undefined;
+    if (!rect || rect.length < 4) continue;
+    const box = rectToBox(rect, viewportTransform);
+    if (box.width <= 0 || box.height <= 0) continue;
+    regions.push({ kind: annotation.subtype === 'Widget' ? 'form-field' : 'annotation', box });
+  }
+  return regions;
+}
+
+/**
+ * Below this size on both sides, in PDF points, an image is an icon: too small
+ * to hold a readable email, phone number, or URL. Skipping icons keeps the many
+ * CVs that put a phone glyph next to the number off the vision path.
+ */
+const MIN_IMAGE_POINTS = 24;
+
+const IMAGE_OPS = new Set<number>([
+  OPS.paintImageXObject,
+  OPS.paintInlineImageXObject,
+  OPS.paintImageMaskXObject,
+]);
+/** Batched image ops whose placement is not a single unit square. */
+const IMAGE_BATCH_OPS = new Set<number>([
+  OPS.paintInlineImageXObjectGroup,
+  OPS.paintImageXObjectRepeat,
+  OPS.paintImageMaskXObjectGroup,
+  OPS.paintImageMaskXObjectRepeat,
+]);
+
+/**
+ * Where the page paints raster images. An image is drawn into the unit square
+ * of the current transform, so the transform is tracked through the operator
+ * list the same way the renderer tracks it.
+ */
+async function extractImages(page: PDFPageProxy, viewportTransform: number[]): Promise<OpaqueRegion[]> {
+  const list = await page.getOperatorList({ annotationMode: AnnotationMode.DISABLE });
+  const regions: OpaqueRegion[] = [];
+  const stack: number[][] = [];
+  let ctm = [1, 0, 0, 1, 0, 0];
+
+  for (let i = 0; i < list.fnArray.length; i++) {
+    const op = list.fnArray[i]!;
+    const args = list.argsArray[i] as unknown[] | null;
+
+    if (op === OPS.save) {
+      stack.push(ctm);
+    } else if (op === OPS.restore) {
+      ctm = stack.pop() ?? ctm;
+    } else if (op === OPS.transform) {
+      ctm = Util.transform(ctm, args as number[]);
+    } else if (op === OPS.paintFormXObjectBegin) {
+      stack.push(ctm);
+      const matrix = args?.[0] as number[] | null | undefined;
+      if (matrix) ctm = Util.transform(ctm, matrix);
+    } else if (op === OPS.paintFormXObjectEnd) {
+      ctm = stack.pop() ?? ctm;
+    } else if (op === OPS.beginGroup) {
+      stack.push(ctm);
+      const matrix = (args?.[0] as { matrix?: number[] | null } | undefined)?.matrix;
+      if (matrix) ctm = Util.transform(ctm, matrix);
+    } else if (op === OPS.endGroup) {
+      ctm = stack.pop() ?? ctm;
+    } else if (IMAGE_OPS.has(op)) {
+      const size = rectToBox([0, 0, 1, 1], ctm);
+      if (size.width < MIN_IMAGE_POINTS && size.height < MIN_IMAGE_POINTS) continue;
+      regions.push({ kind: 'image', box: rectToBox([0, 0, 1, 1], Util.transform(viewportTransform, ctm)) });
+    } else if (IMAGE_BATCH_OPS.has(op)) {
+      // Placement of each tile is not tracked, so treat the whole page as covered.
+      const [x0, y0, x1, y1] = page.view as number[];
+      regions.push({ kind: 'image', box: rectToBox([x0!, y0!, x1!, y1!], viewportTransform) });
+    }
+  }
+  return regions;
+}
+
+/** Axis-aligned bounding box of a rectangle after a transform. */
+function rectToBox(rect: number[], transform: number[]): Box {
+  const corners = [
+    [rect[0]!, rect[1]!],
+    [rect[2]!, rect[1]!],
+    [rect[0]!, rect[3]!],
+    [rect[2]!, rect[3]!],
+  ].map((corner) => Util.applyTransform(corner, transform));
+  const xs = corners.map((c) => c[0]!);
+  const ys = corners.map((c) => c[1]!);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
 }
 
 /**
@@ -185,6 +290,8 @@ async function extractWords(
   const words: Word[] = [];
   const boxes: { box: Box; text: string }[] = [];
 
+  const styles = content.styles as Record<string, { fontFamily?: string } | undefined>;
+
   for (const raw of content.items) {
     const item = raw as TextItem;
     if (!item.str || !item.str.trim()) continue;
@@ -193,14 +300,20 @@ async function extractWords(
     const fontHeight = Math.hypot(tx[2]!, tx[3]!);
     if (fontHeight <= 0) continue;
 
-    const runWidth = Math.abs(item.width * (tx[0]! / (item.transform[0]! || 1)));
-    const width = Number.isFinite(runWidth) && runWidth > 0 ? runWidth : fontHeight * item.str.length * 0.5;
-    const left = tx[4]!;
-    // tx[5] is the baseline. Descenders live below it, ascenders above.
-    const top = tx[5]! - fontHeight * 0.88;
-    const height = fontHeight * 1.16;
+    // The run's baseline and up directions in raster space. Text can be rotated,
+    // so a word box is the bounding box of its rotated rectangle, not a strip
+    // laid along the x axis.
+    const baselineLength = Math.hypot(tx[0]!, tx[1]!);
+    const along = baselineLength > 0 ? [tx[0]! / baselineLength, tx[1]! / baselineLength] : [1, 0];
+    const up = [tx[2]! / fontHeight, tx[3]! / fontHeight];
 
-    const advances = apportion(item.str, width, fontHeight, item.fontName);
+    const textScale = baselineLength / (Math.hypot(item.transform[0]!, item.transform[1]!) || 1);
+    const runWidth = Math.abs(item.width * textScale);
+    const width = Number.isFinite(runWidth) && runWidth > 0 ? runWidth : fontHeight * item.str.length * 0.5;
+
+    // pdf.js names fonts by internal id (g_d0_f1); the class it resolved lives in styles.
+    const family = styles[item.fontName]?.fontFamily ?? item.fontName;
+    const advances = apportion(item.str, width, fontHeight, family);
     let cursor = 0;
     let offset = 0;
     for (const piece of item.str.split(/(\s+)/)) {
@@ -209,7 +322,7 @@ async function extractWords(
       if (piece.trim()) {
         boxes.push({
           text: piece,
-          box: { x: left + offset, y: top, width: pieceWidth, height },
+          box: runBox(tx[4]!, tx[5]!, along, up, offset, pieceWidth, fontHeight),
         });
       }
       cursor += piece.length;
@@ -229,6 +342,33 @@ async function extractWords(
     });
   }
   return sortReadingOrder(words);
+}
+
+/**
+ * The box for a stretch of a text run, from `offset` to `offset + width` along
+ * the baseline. Descenders reach 0.28 of the font height below the baseline and
+ * ascenders 0.88 above it.
+ */
+function runBox(
+  originX: number,
+  originY: number,
+  along: number[],
+  up: number[],
+  offset: number,
+  width: number,
+  fontHeight: number,
+): Box {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const distance of [offset, offset + width]) {
+    for (const rise of [fontHeight * 0.88, -fontHeight * 0.28]) {
+      xs.push(originX + along[0]! * distance + up[0]! * rise);
+      ys.push(originY + along[1]! * distance + up[1]! * rise);
+    }
+  }
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
 }
 
 function sum(values: number[], from: number, count: number): number {

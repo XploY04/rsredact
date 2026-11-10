@@ -124,10 +124,16 @@ The reason is that hiding link text mostly destroys information for no privacy g
 | `linkText` | Link is dead | Link text readable | Use when |
 |---|---|---|---|
 | `keep` (default) | yes | yes | Normal blind hiring. Employer names, certifications, and project titles stay readable. |
-| `redact-identifying` | yes | hidden when its destination matches a requested **pattern** target, readable otherwise | You want a link reading `github.com/someone` gone. Read the caveat below first. |
+| `redact-identifying` | yes | hidden when its destination points at the candidate, readable otherwise | You want a link reading `github.com/someone` gone. Read the caveat below first. |
 | `redact-all` | yes | no | The output must show no trace that a link was ever there. |
 
-`redact-identifying` is blunter than it sounds, and worth understanding before you switch it on. It matches the destination against the regexes of the targets you asked for, so only `social`, `url`, `email`, `phone`, and `dob` can ever trigger it. Ask for `redact-identifying` with a model-only target set like `['name', 'photo']` and it does nothing at all. And because the match is on the URL host rather than on any judgement about whose page it is, an employer whose name links to its LinkedIn company page loses that name, while one that links to its own domain keeps it. On the resume we tested, "Embeddings Co" and "Aspora (Vance)" were hidden because both link to `linkedin.com/company/...`, and "CloudSEK" survived because it links to `cloudsek.com`.
+`redact-identifying` decides from the destination alone, so it is worth knowing exactly which destinations count:
+
+- a `mailto:` link, when `email` is a target, and a `tel:` link, when `phone` is;
+- a profile on a host the `social` target knows, when `social` is a target. A repository (`github.com/acme/pg-operator`) and a LinkedIn company, school or showcase page are not profiles, so "Kubernetes Operator for Postgres" and "Embeddings Co" stay readable;
+- anything matching the patterns of a target you defined yourself.
+
+The `url`, `phone` and `dob` patterns never count on an ordinary web link. `url` matches every website, so it would hide every employer that links to its own site, and the phone and date patterns match the digits in long URLs. Ask for `redact-identifying` with a model-only target set like `['name', 'photo']` and it does nothing at all.
 
 Separately from all of this, a URL written out as **visible text** is identifying content in its own right, because a reader can simply type it. That is handled by the `url` target (any URL) and the `social` target (known profile hosts), not by `linkText`. Ask for `url` and `github.com/someone` written in the body gets redacted whether or not anything linked to it.
 
@@ -205,6 +211,7 @@ Add `patterns: [/.../ ]` and the regexes run before any model call. Add `visualO
 | `provider` | none | Omit to run pattern and link detection only |
 | `mode` | `auto` | `auto`, `text`, `vision`, `patterns-only` |
 | `linkText` | `keep` | `keep`, `redact-identifying`, `redact-all` |
+| `opaqueContent` | `ignore` | `vision` also checks images, form fields and annotations on text pages, see below |
 | `style` | `blur` | `blur`, `box`, `label`, `pixelate` |
 | `dpi` | `150` | Render resolution |
 | `padding` | `2` | Pixels added around every box |
@@ -222,6 +229,12 @@ Every style destroys the text, because the page is rebuilt from pixels either wa
 
 `box` is the only style that leaves nothing. Pass it when the output goes anywhere you do not control, or when even the length of a name is more than you want to disclose. `label` is `box` with the target name printed on the fill, which is useful when a human needs to see that nothing was covered by accident.
 
+### Content the text layer cannot read
+
+An email pasted in as a picture, typed into a form field, or added as a FreeText annotation is painted on the page but is not in its text layer, so text detection never sees it. `opaqueContent: 'vision'` sends every text page that has such content through one extra vision call for the text targets, and paints only where a finding overlaps that content: all of a form field or annotation, or the part of an image under the model's rectangle grown by one grid cell. Images under 24 points on both sides are icons and do not count, so a phone glyph next to the number does not cost a call. Pages with no text layer follow the mode as before.
+
+What it cannot catch: text drawn as vector outlines rather than as text or an image.
+
 ### What throws and what warns
 
 The rule is that anything which would make the output untrustworthy throws, and anything that cost you one box warns. Worth knowing before you write a batch loop, because a throw means there is no PDF at all.
@@ -233,6 +246,7 @@ The rule is that anything which would make the output untrustworthy throws, and 
 | `openai`, `@anthropic-ai/sdk`, or `tesseract.js` is needed and not installed | throws `MissingDependencyError`, carrying the install command |
 | The provider errors, refuses, or has no API key | throws `ProviderError`, and no PDF comes back |
 | A vision target is asked of a provider that cannot see | throws `ProviderError` |
+| `opaqueContent: 'vision'` meets a page with an image, form field or annotation, and the provider cannot see | throws `RedactError` with code `VISION_UNAVAILABLE` |
 | The model quotes text that is not on the page | warns, that one detection is dropped |
 | The model returns an unreadable grid reference | warns, that one detection is dropped |
 | A model target was asked for with no provider | warns, except in `patterns-only` |
@@ -260,7 +274,7 @@ customProvider({
 
 `openai` and `@anthropic-ai/sdk` are optional peer dependencies, loaded only when used. Install just the one you need.
 
-For OpenAI, schemas are rewritten to the strict structured-outputs subset on the way out, so a custom target's schema cannot break the request.
+For OpenAI, schemas are rewritten to the strict structured-outputs subset on the way out, so a custom target's schema cannot break the request. `openaiProvider` also takes `timeoutMs` and `maxRetries`, which otherwise default to the SDK's ten minutes and two retries, and passes a request's `signal` through so a call can be aborted.
 
 There is also `scriptedProvider([...])`, which replays canned responses. It is how the test suite runs the whole pipeline without a network call.
 
@@ -331,7 +345,7 @@ docker build -t rsredact .
 docker run -p 8080:8080 -e OPENAI_API_KEY=... rsredact
 ```
 
-The image runs as the non-root `node` user and works with a read-only root filesystem.
+The image runs as the non-root `node` user, works with a read-only root filesystem, and has a `HEALTHCHECK` against `/healthz`. The base image is pinned by digest in the `NODE_IMAGE` build argument.
 
 ```
 curl -X POST http://localhost:8080/v1/redact \
@@ -345,14 +359,26 @@ curl -X POST http://localhost:8080/v1/redact \
 | `/v1/redact` | POST | Redact one PDF. Multipart form: `file` (the PDF, up to 25 MiB) and optional `known`. |
 | `/healthz` | GET | Returns `ok`. Never needs a token and is not logged. |
 
-What it runs: `mode: 'text'` with the OpenAI provider, `style: 'box'`, `linkText: 'redact-identifying'`, `maxPages: 20`, OCR off. The targets are `email`, `phone`, `social`, `url` and a `handle` target for `@someone`. `name` is not a target, so the candidate's name stays readable.
+What it runs: `mode: 'text'` with the OpenAI provider, `opaqueContent: 'vision'`, `style: 'box'`, `linkText: 'redact-identifying'`, `maxPages: 20`, OCR off. The targets are `email`, `phone`, `social`, `url` and a `handle` target for `@someone`. `name` is not a target, so the candidate's name stays readable. A page with an image, form field or annotation costs a second model call; see [Content the text layer cannot read](#content-the-text-layer-cannot-read).
 
-`known` is the contact details you already hold for the candidate, as JSON with optional `emails`, `phones` and `urls` arrays (up to 20 strings each). Each value becomes an exact-match pattern on top of the built-in ones:
+The `handle` target skips what only looks like one: Java and TypeScript annotations (`@Transactional`, `@Injectable`), Python decorators, CSS at-rules, and npm scopes (`@ngrx/store`). The `url` target skips framework and degree names spelled like domains (`ASP.NET`, `Socket.IO`, `B.Tech`).
+
+`known` is the contact details you already hold for the candidate, as JSON with optional `emails`, `phones` and `urls` arrays (up to 20 strings each). A value that cannot be what it claims is dropped rather than refused: an email needs an `@` with a dot after it, a phone needs 8 digits, and a URL needs a dot. That keeps a placeholder like `"na"` or `"-"` from becoming a pattern that wipes ordinary text. Each value left becomes an exact-match pattern on top of the built-in ones:
 
 - an email matches regardless of case;
 - a phone matches its digits with optional spaces or dashes between them and an optional `+91` in front, so `+919876543210` also catches `98765 43210`;
-- a URL matches with or without its scheme and `www.`;
-- a LinkedIn or GitHub URL also matches the bare slug and every dash-joined tail of it at least six characters long, such as `-doe-1a2b`. That is what catches a profile URL that wrapped onto a second line and left half its slug readable. Every one of those patterns contains a dash, so the name written with a space never matches.
+- a URL matches with or without its scheme and `www.`, but not with more path after it, so a profile URL does not hide links to its own repositories.
+
+A LinkedIn or GitHub URL also matches the pieces of its slug that a line wrap leaves behind. A wrap splits `jane-doe-1a2b` before a dash, leaving `-doe-1a2b`, or after one, leaving `doe-1a2b` at the start of the next line. The rules exist to keep the name readable, including hyphenated ones:
+
+| Piece | Matches | Example |
+|---|---|---|
+| Tail with a leading dash, 6+ characters | anywhere, but not straight after a letter or digit | `-doe-1a2b`, never the `-Jones` in `Smith-Jones` |
+| Tail without a leading dash, still containing a dash | only at the start of a line, after nothing but punctuation; anywhere if it has a digit | `doe-1a2b`, never `Smith-Jones` in `Mary Smith-Jones` |
+| Whole slug with dashes | only after a `/`, or anywhere if it has a digit | `in/jean-pierre`, never `Jean-Pierre Martin` |
+| One-word slug | as a whole word, only with a digit or underscore, or 8+ characters | `xploy04`, never `priya` |
+
+A one-word slug of 8 or more letters that is also the candidate's surname would hide that surname wherever it appears. The server is not told the name, so it cannot rule this out.
 
 A 200 is the redacted PDF, with these headers:
 
@@ -360,7 +386,7 @@ A 200 is the redacted PDF, with these headers:
 |---|---|
 | `X-Rsredact-Duration-Ms` | Total time on the server, including any wait in the queue. |
 | `X-Rsredact-Model-Ms` | Time spent in model calls, summed. |
-| `X-Rsredact-Llm-Calls` | Model calls made. One per page. |
+| `X-Rsredact-Llm-Calls` | Model calls made. One per page, two on a page with an image, form field or annotation. |
 | `X-Rsredact-Detections` | JSON counts per target, such as `{"email+known_email":1,"social":1}`. Read the `+` the way [Checking the output](#checking-the-output) describes. |
 | `X-Rsredact-Version` | Package version plus a hash of the options, such as `0.1.0+58bdc5365928`. If you cache the output, store this beside it and redact again when it changes. It does not cover `known`, so redact again when the candidate's contact details change too. |
 
@@ -373,10 +399,11 @@ Errors are JSON, `{"error":"code","message":"..."}`:
 | 400 | `bad_request` | Not multipart, no `file`, empty file, or `known` is not the shape above. |
 | 401 | `unauthorized` | A token is configured and the request did not send it. |
 | 413 | `too_large` | The file is over 25 MiB. |
-| 422 | `unsupported` | Not a PDF, over 20 pages, too large to rasterise, encrypted, or corrupt. |
+| 422 | `unsupported` | Not a PDF, over 20 pages, too large to rasterise, encrypted, or corrupt. Also a page with an image, form field or annotation when the model cannot do vision. |
 | 422 | `scanned` | A page has no text layer. Text mode cannot read it and would hand it back unredacted, so the whole file is refused. |
 | 422 | `verification_failed` | The output still had text or links. This should never happen; treat it as a bug. |
 | 429 | `queue_full` | Every slot and the queue are taken. Retry later. |
+| 500 | `timeout` | The request passed `RSREDACT_REQUEST_TIMEOUT_MS`, counted from arrival, queue included. Any model call in flight is aborted. |
 | 500 | `provider_error` or `internal` | The model call failed, or something else did. The cause goes to the log, not the response. |
 
 Configuration:
@@ -387,7 +414,9 @@ Configuration:
 | `RSREDACT_MODEL` | `gpt-4.1` | Model for text detection. |
 | `RSREDACT_API_TOKEN` | none | When set, `/v1/redact` requires `Authorization: Bearer <token>`. |
 | `RSREDACT_MAX_CONCURRENCY` | `2` | Redactions in flight at once. Each makes one model call per page, so this is also the cap on concurrent OpenAI calls per replica. |
-| `RSREDACT_MAX_QUEUE` | `20` | Requests that wait for a slot. Past this the answer is 429. |
+| `RSREDACT_MAX_QUEUE` | `20` | Requests that wait for a slot. Past this the answer is 429. A waiting request's body is not read until it has a slot, so the queue costs no memory. |
+| `RSREDACT_REQUEST_TIMEOUT_MS` | `120000` | Deadline for a whole request, queue included. |
+| `RSREDACT_MODEL_TIMEOUT_MS` | `60000` | Deadline for one model call. The SDK does not retry, because a retry is another full-price call. |
 | `PORT` | `8080` | Listen port. |
 
 Each request logs one JSON line to stdout with the status, duration, page count, detection counts, model calls and model time:
@@ -396,7 +425,7 @@ Each request logs one JSON line to stdout with the status, duration, page count,
 {"method":"POST","path":"/v1/redact","status":200,"duration_ms":406,"pages":1,"detections":{"email+known_email":1,"social":1},"llm_calls":1,"model_ms":34}
 ```
 
-No document text and no contact value is ever logged.
+No document text and no contact value is ever logged. The model can only name targets that were asked for, so detection counts carry fixed names, and a failed model call is logged by error name and HTTP status only, because its message can quote the model's reply. A client that hangs up stops its redaction at the next model call, frees its slot, and is logged with status 499.
 
 One thing to know before relying on it: if the visible text of a link is the candidate's name and the link goes to their LinkedIn, `redact-identifying` hides the name along with the link, even though `name` is not a target.
 

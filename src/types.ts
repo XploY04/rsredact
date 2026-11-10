@@ -40,6 +40,17 @@ export interface Page {
    * extraction never sees, so links are collected separately.
    */
   links: PageLink[];
+  /**
+   * Content painted on the page that the text layer does not carry: raster
+   * images, form fields, and annotations such as FreeText. An email drawn as
+   * an image or typed into a form field is invisible to text detection.
+   */
+  opaque: OpaqueRegion[];
+}
+
+export interface OpaqueRegion {
+  kind: 'image' | 'form-field' | 'annotation';
+  box: Box;
 }
 
 export interface LoadedDocument {
@@ -165,6 +176,17 @@ export interface RedactOptions {
    * content, and is redacted whenever the 'url' or 'social' target is requested.
    */
   linkText?: 'keep' | 'redact-identifying' | 'redact-all';
+  /**
+   * What to do about content the text layer cannot read: images, form fields,
+   * and painted annotations (see `Page.opaque`).
+   *
+   * 'ignore' (default) leaves it to the mode: text mode never looks at it.
+   * 'vision' also runs vision detection for the text targets on every page
+   * that has a text layer and opaque content, and paints only where a finding
+   * overlaps that content. It needs a provider that supports vision, and it
+   * costs one more model call on each such page.
+   */
+  opaqueContent?: 'ignore' | 'vision';
   /** Run OCR when a page has no text layer. Requires tesseract.js. Default true. */
   ocr?: boolean;
   /** Language passed to tesseract. Default 'eng'. */
@@ -256,6 +278,8 @@ export interface ProviderRequest {
     schema: Record<string, unknown>;
   };
   maxTokens: number;
+  /** Abort the call when this fires. Providers pass it to their HTTP client. */
+  signal?: AbortSignal;
 }
 
 /**

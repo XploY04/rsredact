@@ -17,11 +17,17 @@ const model = process.env.RSREDACT_MODEL || DEFAULT_MODEL;
 const port = positiveInt('PORT', 8080);
 
 const server = createRedactServer({
-  provider: openaiProvider({ model }),
+  // A retry is a second full-price call per page, so a failed call fails the request instead.
+  provider: openaiProvider({
+    model,
+    timeoutMs: positiveInt('RSREDACT_MODEL_TIMEOUT_MS', 60_000),
+    maxRetries: 0,
+  }),
   model,
   apiToken: process.env.RSREDACT_API_TOKEN || undefined,
   maxConcurrency: positiveInt('RSREDACT_MAX_CONCURRENCY', 2),
   maxQueue: positiveInt('RSREDACT_MAX_QUEUE', 20),
+  requestTimeoutMs: positiveInt('RSREDACT_REQUEST_TIMEOUT_MS', 120_000),
 });
 
 server.listen(port, () => {

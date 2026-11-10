@@ -15,6 +15,7 @@ import { detectWithVision } from './detect/llm-vision.js';
 import { mergeDetections, padDetections } from './detect/merge.js';
 import { buildPdf, paintPages } from './redact/apply.js';
 import { fetchRsparseMarkdown } from './rsparse.js';
+import { RedactError } from './errors.js';
 
 /**
  * Finds and removes the requested identifiers from a CV.
@@ -69,6 +70,40 @@ export async function redact(input: Buffer, options: RedactOptions): Promise<Red
         plan.visionTargets,
         options.provider,
         options.grid,
+      );
+      detections.push(...result.detections);
+      warnings.push(...result.warnings);
+      llmCalls += result.calls;
+    }
+
+    const opaqueTargets = targets.filter((t) => !t.visualOnly);
+    const checkOpaque =
+      options.opaqueContent === 'vision' &&
+      page.words.length > 0 &&
+      page.opaque.length > 0 &&
+      opaqueTargets.length > 0 &&
+      (options.mode ?? 'auto') !== 'patterns-only' &&
+      (options.mode ?? 'auto') !== 'vision';
+    if (checkOpaque) {
+      if (!options.provider?.supportsVision) {
+        throw new RedactError(
+          `page ${page.index + 1} has images, form fields, or annotations that text detection ` +
+            'cannot read, and opaqueContent is "vision", but no provider that supports vision was passed.',
+          'VISION_UNAVAILABLE',
+        );
+      }
+      options.onProgress?.({
+        stage: 'detect-vision',
+        page: page.index,
+        totalPages: document.pages.length,
+        message: 'checking images, form fields, and annotations',
+      });
+      const result = await detectWithVision(
+        page,
+        opaqueTargets,
+        options.provider,
+        options.grid,
+        page.opaque,
       );
       detections.push(...result.detections);
       warnings.push(...result.warnings);

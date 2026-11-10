@@ -15,6 +15,10 @@ export interface OpenAIProviderOptions {
    * to read a page from.
    */
   imageDetail?: 'auto' | 'low' | 'high';
+  /** Per-call timeout in milliseconds. Defaults to the SDK's, which is ten minutes. */
+  timeoutMs?: number;
+  /** Retries the SDK makes on a failed call. Defaults to the SDK's, which is two. */
+  maxRetries?: number;
 }
 
 /**
@@ -37,6 +41,8 @@ export function openaiProvider(options: OpenAIProviderOptions = {}): LLMProvider
       const init: Record<string, unknown> = {};
       if (options.apiKey) init.apiKey = options.apiKey;
       if (options.baseUrl) init.baseURL = options.baseUrl;
+      if (options.timeoutMs !== undefined) init.timeout = options.timeoutMs;
+      if (options.maxRetries !== undefined) init.maxRetries = options.maxRetries;
       return new module.default(init);
     })();
     return clientPromise;
@@ -59,23 +65,26 @@ export function openaiProvider(options: OpenAIProviderOptions = {}): LLMProvider
         });
       }
 
-      const response = await openai.chat.completions.create({
-        model,
-        max_completion_tokens: request.maxTokens,
-        messages: [
-          { role: 'system', content: request.system },
-          { role: 'user', content },
-        ],
-        response_format: {
-          type: 'json_schema',
-          json_schema: {
-            name: request.schema.name,
-            description: request.schema.description,
-            schema: toStrictSchema(request.schema.schema),
-            strict: true,
+      const response = await openai.chat.completions.create(
+        {
+          model,
+          max_completion_tokens: request.maxTokens,
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content },
+          ],
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: request.schema.name,
+              description: request.schema.description,
+              schema: toStrictSchema(request.schema.schema),
+              strict: true,
+            },
           },
         },
-      });
+        request.signal ? { signal: request.signal } : undefined,
+      );
 
       const text = response.choices?.[0]?.message?.content;
       if (!text) {
@@ -97,7 +106,10 @@ export function openaiProvider(options: OpenAIProviderOptions = {}): LLMProvider
 interface OpenAILike {
   chat: {
     completions: {
-      create(body: Record<string, unknown>): Promise<{
+      create(
+        body: Record<string, unknown>,
+        options?: { signal?: AbortSignal },
+      ): Promise<{
         choices?: { message?: { content?: string | null } }[];
       }>;
     };

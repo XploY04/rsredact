@@ -12,6 +12,12 @@ const MAX_VALUE_LENGTH = 300;
 
 /** Shortest slug suffix, dash included, worth matching on its own. */
 const MIN_SUFFIX_LENGTH = 6;
+/** A one-word slug shorter than this, with no digit or underscore, could be a name. */
+const MIN_PLAIN_SLUG_LENGTH = 8;
+const MIN_SLUG_LENGTH = 5;
+const MIN_PHONE_DIGITS = 8;
+
+const VALID_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export class KnownValuesError extends Error {}
 
@@ -44,10 +50,18 @@ export function parseKnown(raw: string | null): KnownValues {
         throw new KnownValuesError(`a known.${kind} entry is longer than ${MAX_VALUE_LENGTH} characters`);
       }
       const trimmed = value.trim();
-      if (trimmed) known[kind].push(trimmed);
+      // A placeholder like "na" or "-" would otherwise become a pattern that wipes
+      // ordinary text, so anything that cannot be the value it claims is dropped.
+      if (isUsable(kind, trimmed)) known[kind].push(trimmed);
     }
   }
   return known;
+}
+
+function isUsable(kind: keyof KnownValues, value: string): boolean {
+  if (kind === 'emails') return VALID_EMAIL.test(value);
+  if (kind === 'phones') return value.replace(/\D/g, '').length >= MIN_PHONE_DIGITS;
+  return urlCore(value).includes('.');
 }
 
 /**
@@ -97,7 +111,7 @@ function phonePattern(phone: string): RegExp[] {
   let digits = phone.replace(/\D/g, '');
   if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
   else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
-  if (digits.length < 7) return [];
+  if (digits.length < MIN_PHONE_DIGITS) return [];
 
   const body = digits.split('').join('[\\s-]?');
   return [new RegExp(`(?<!\\d)(?:\\+?91[\\s-]?|0)?${body}(?!\\d)`, 'g')];
@@ -105,34 +119,72 @@ function phonePattern(phone: string): RegExp[] {
 
 /**
  * The URL itself with or without scheme and www, and for a LinkedIn or GitHub
- * profile, the pieces of its slug that a line wrap can leave stranded. Every
- * slug pattern contains a dash, so the candidate's name written with a space
- * ("Singh Gour") never matches.
+ * profile, the pieces of its slug that a line wrap can leave stranded.
+ *
+ * A wrap splits "yash-singh-gour" either before a dash, leaving "-singh-gour",
+ * or after one, leaving "singh-gour" at the start of the next line. Both are
+ * matched. The rules keep the candidate's name readable:
+ *
+ * - A tail with a leading dash matches anywhere, but not straight after a
+ *   letter, so "-jones" never matches inside "Smith-Jones".
+ * - A tail without a leading dash must still contain a dash, and must start
+ *   its line, so "smith-jones" never matches "Mary Smith-Jones".
+ * - The whole slug matches after a "/" ("in/jean-pierre"), or anywhere when it
+ *   has a digit. On its own it can be a hyphenated first name.
+ * - A one-word slug ("xploy04") matches as a whole word only when it has a
+ *   digit or underscore, or is at least eight characters. A shorter plain one
+ *   like "priya" is too likely to be the name itself.
+ *
+ * Tails shorter than six characters, dash included, are skipped.
  */
 function urlPatterns(url: string): RegExp[] {
-  const core = url
+  const core = urlCore(url);
+  if (core.length < 4) return [];
+
+  // Not followed by more path, so the profile URL does not match its own repositories.
+  const patterns = [new RegExp(`(?:https?://)?(?:www\\.)?${escapeRegExp(core)}/?(?![\\w./-])`, 'gi')];
+
+  const slug = profileSlug(core);
+  if (!slug) return patterns;
+
+  const parts = slug.split('-').filter(Boolean);
+  const hasDigit = (piece: string) => /\d/.test(piece);
+
+  if (parts.length === 1) {
+    if (slug.length >= MIN_SLUG_LENGTH && (/[\d_]/.test(slug) || slug.length >= MIN_PLAIN_SLUG_LENGTH)) {
+      patterns.push(new RegExp(`(?<![a-z0-9_])${escapeRegExp(slug)}(?![a-z0-9_])`, 'gi'));
+    }
+    return patterns;
+  }
+
+  const whole = parts.join('-');
+  patterns.push(
+    hasDigit(whole)
+      ? new RegExp(`(?<![a-z0-9])${escapeRegExp(whole)}(?![a-z0-9])`, 'gi')
+      : new RegExp(`(?<=/)${escapeRegExp(whole)}(?![a-z0-9])`, 'gi'),
+  );
+
+  for (let i = 1; i < parts.length; i++) {
+    const tail = parts.slice(i).join('-');
+    if (tail.length + 1 >= MIN_SUFFIX_LENGTH) {
+      patterns.push(new RegExp(`(?<![a-z0-9])-${escapeRegExp(tail)}(?![a-z0-9])`, 'gi'));
+    }
+    if (!tail.includes('-')) continue;
+    patterns.push(
+      hasDigit(tail)
+        ? new RegExp(`(?<![a-z0-9])${escapeRegExp(tail)}(?![a-z0-9])`, 'gi')
+        : new RegExp(`(?<=^[^a-z0-9]*)${escapeRegExp(tail)}(?![a-z0-9])`, 'gi'),
+    );
+  }
+  return patterns;
+}
+
+function urlCore(url: string): string {
+  return url
     .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
     .replace(/^www\./i, '')
     .split(/[?#]/)[0]!
     .replace(/\/+$/, '');
-  if (core.length < 4) return [];
-
-  const patterns = [new RegExp(`(?:https?://)?(?:www\\.)?${escapeRegExp(core)}`, 'gi')];
-
-  const slug = profileSlug(core);
-  if (slug) {
-    const parts = slug.split('-').filter(Boolean);
-    const pieces = new Set<string>();
-    if (parts.length > 1) pieces.add(parts.join('-'));
-    for (let i = 1; i < parts.length; i++) {
-      const suffix = `-${parts.slice(i).join('-')}`;
-      if (suffix.length >= MIN_SUFFIX_LENGTH) pieces.add(suffix);
-    }
-    for (const piece of pieces) {
-      patterns.push(new RegExp(`(?<![a-z0-9])${escapeRegExp(piece)}(?![a-z0-9])`, 'gi'));
-    }
-  }
-  return patterns;
 }
 
 function profileSlug(core: string): string | null {

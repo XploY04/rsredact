@@ -78,5 +78,6 @@ async function loadRasterPage(data: Buffer): Promise<Page> {
     words: [],
     textSource: 'none',
     links: [],
+    opaque: [],
   };
 }

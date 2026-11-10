@@ -1,4 +1,4 @@
-import type { Box, Detection, LLMProvider, Page, ResolvedTarget, GridOptions } from '../types.js';
+import type { Box, Detection, LLMProvider, OpaqueRegion, Page, ResolvedTarget, GridOptions } from '../types.js';
 import { ProviderError } from '../errors.js';
 import { unionBox } from './lines.js';
 import {
@@ -10,7 +10,7 @@ import {
   parseCell,
   type Grid,
 } from './grid.js';
-import { VISION_SCHEMA, VISION_SYSTEM, visionPrompt } from './prompts.js';
+import { VISION_SYSTEM, visionPrompt, visionSchema } from './prompts.js';
 
 interface GridRedaction {
   target: string;
@@ -27,11 +27,20 @@ export interface VisionDetectionResult {
   overlay: Buffer;
 }
 
+/**
+ * `clipTo` limits findings to those regions, with no snapping to words. That
+ * is how content the text layer cannot read is checked without letting a
+ * coarse cell spill onto text that text detection already judged. A form field
+ * or annotation holds one value, so a finding covers all of it. An image can
+ * hold a whole header, so a finding covers where the rectangle, grown by one
+ * cell to allow for the grid's imprecision, overlaps the image.
+ */
 export async function detectWithVision(
   page: Page,
   targets: ResolvedTarget[],
   provider: LLMProvider,
   gridOptions: GridOptions | undefined,
+  clipTo?: OpaqueRegion[],
 ): Promise<VisionDetectionResult> {
   if (!provider.supportsVision) {
     throw new ProviderError(
@@ -51,7 +60,7 @@ export async function detectWithVision(
       system: VISION_SYSTEM,
       prompt: visionPrompt(targets, grid.cols, grid.rows, columnLabel(grid.cols - 1)),
       images: [{ mediaType: 'image/png', data: overlay.toString('base64') }],
-      schema: VISION_SCHEMA as never,
+      schema: visionSchema(targets.map((t) => t.id)) as never,
       maxTokens: 4096,
     });
   } catch (error) {
@@ -63,9 +72,14 @@ export async function detectWithVision(
   }
 
   const snap = gridOptions?.snapToWords ?? DEFAULT_GRID.snapToWords;
+  const targetIds = new Set(targets.map((t) => t.id));
   const detections: Detection[] = [];
 
   for (const item of response.redactions ?? []) {
+    if (!targetIds.has(item.target)) {
+      warnings.push(`page ${page.index + 1}: dropped a finding for a target that was not requested`);
+      continue;
+    }
     const from = parseCell(item.from ?? '');
     const to = parseCell(item.to ?? '');
     if (!from || !to) {
@@ -78,7 +92,22 @@ export async function detectWithVision(
 
     const cellBox = cellRangeToBox(grid, from, to);
     const confidence = clamp(item.confidence);
-    const target = item.target || 'unknown';
+    const target = item.target;
+
+    if (clipTo) {
+      const grown = {
+        x: cellBox.x - grid.cellWidth,
+        y: cellBox.y - grid.cellHeight,
+        width: cellBox.width + 2 * grid.cellWidth,
+        height: cellBox.height + 2 * grid.cellHeight,
+      };
+      for (const region of clipTo) {
+        if (!intersect(cellBox, region.box)) continue;
+        const box = region.kind === 'image' ? intersect(grown, region.box)! : region.box;
+        detections.push({ page: page.index, target, box, confidence, source: 'llm-vision' });
+      }
+      continue;
+    }
 
     const refined = snap ? snapToWords(page, cellBox) : [];
     if (refined.length > 0) {
@@ -138,6 +167,15 @@ function snapToWords(
         wordIds: ordered.map((w) => w.id),
       };
     });
+}
+
+function intersect(a: Box, b: Box): Box | null {
+  const x = Math.max(a.x, b.x);
+  const y = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const bottom = Math.min(a.y + a.height, b.y + b.height);
+  if (right <= x || bottom <= y) return null;
+  return { x, y, width: right - x, height: bottom - y };
 }
 
 /** Fraction of `inner` that lies within `outer`. */

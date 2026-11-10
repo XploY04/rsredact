@@ -322,12 +322,91 @@ Calls scale with pages, not with findings. Every page gets one text call, and ev
 
 We tested this on a real resume. The contact block went, 21 hyperlinks died, and the remaining text still pointed at exactly one person. `employer` and `school` help, because they remove the prestige signal a reviewer reacts to first, but they are coarse and plenty of context survives them. Treat the output as bias-reduced rather than anonymous. If you need anonymity, a person has to read the result and judge whether what is left is too specific.
 
+## Running it as a service
+
+The repo also builds an HTTP server, so a backend in any language can redact a CV per request. It runs one fixed policy, the one RemoteStar shows to companies: contact details go, the name stays.
+
+```
+docker build -t rsredact .
+docker run -p 8080:8080 -e OPENAI_API_KEY=... rsredact
+```
+
+The image runs as the non-root `node` user and works with a read-only root filesystem.
+
+```
+curl -X POST http://localhost:8080/v1/redact \
+  -F file=@cv.pdf \
+  -F 'known={"emails":["jane@example.com"],"phones":["+91 98765 43210"],"urls":["https://linkedin.com/in/jane-doe-1a2b"]}' \
+  -o cv.redacted.pdf -D -
+```
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/v1/redact` | POST | Redact one PDF. Multipart form: `file` (the PDF, up to 25 MiB) and optional `known`. |
+| `/healthz` | GET | Returns `ok`. Never needs a token and is not logged. |
+
+What it runs: `mode: 'text'` with the OpenAI provider, `style: 'box'`, `linkText: 'redact-identifying'`, `maxPages: 20`, OCR off. The targets are `email`, `phone`, `social`, `url` and a `handle` target for `@someone`. `name` is not a target, so the candidate's name stays readable.
+
+`known` is the contact details you already hold for the candidate, as JSON with optional `emails`, `phones` and `urls` arrays (up to 20 strings each). Each value becomes an exact-match pattern on top of the built-in ones:
+
+- an email matches regardless of case;
+- a phone matches its digits with optional spaces or dashes between them and an optional `+91` in front, so `+919876543210` also catches `98765 43210`;
+- a URL matches with or without its scheme and `www.`;
+- a LinkedIn or GitHub URL also matches the bare slug and every dash-joined tail of it at least six characters long, such as `-doe-1a2b`. That is what catches a profile URL that wrapped onto a second line and left half its slug readable. Every one of those patterns contains a dash, so the name written with a space never matches.
+
+A 200 is the redacted PDF, with these headers:
+
+| Header | Value |
+|---|---|
+| `X-Rsredact-Duration-Ms` | Total time on the server, including any wait in the queue. |
+| `X-Rsredact-Model-Ms` | Time spent in model calls, summed. |
+| `X-Rsredact-Llm-Calls` | Model calls made. One per page. |
+| `X-Rsredact-Detections` | JSON counts per target, such as `{"email+known_email":1,"social":1}`. Read the `+` the way [Checking the output](#checking-the-output) describes. |
+| `X-Rsredact-Version` | Package version plus a hash of the options, such as `0.1.0+58bdc5365928`. If you cache the output, store this beside it and redact again when it changes. It does not cover `known`, so redact again when the candidate's contact details change too. |
+
+Before answering, the server opens its own output with pdf.js and checks that every page has no text items and no annotations. Anything else is a 422, not a PDF.
+
+Errors are JSON, `{"error":"code","message":"..."}`:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 400 | `bad_request` | Not multipart, no `file`, empty file, or `known` is not the shape above. |
+| 401 | `unauthorized` | A token is configured and the request did not send it. |
+| 413 | `too_large` | The file is over 25 MiB. |
+| 422 | `unsupported` | Not a PDF, over 20 pages, too large to rasterise, encrypted, or corrupt. |
+| 422 | `scanned` | A page has no text layer. Text mode cannot read it and would hand it back unredacted, so the whole file is refused. |
+| 422 | `verification_failed` | The output still had text or links. This should never happen; treat it as a bug. |
+| 429 | `queue_full` | Every slot and the queue are taken. Retry later. |
+| 500 | `provider_error` or `internal` | The model call failed, or something else did. The cause goes to the log, not the response. |
+
+Configuration:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | required | The server will not start without it. |
+| `RSREDACT_MODEL` | `gpt-4.1` | Model for text detection. |
+| `RSREDACT_API_TOKEN` | none | When set, `/v1/redact` requires `Authorization: Bearer <token>`. |
+| `RSREDACT_MAX_CONCURRENCY` | `2` | Redactions in flight at once. Each makes one model call per page, so this is also the cap on concurrent OpenAI calls per replica. |
+| `RSREDACT_MAX_QUEUE` | `20` | Requests that wait for a slot. Past this the answer is 429. |
+| `PORT` | `8080` | Listen port. |
+
+Each request logs one JSON line to stdout with the status, duration, page count, detection counts, model calls and model time:
+
+```
+{"method":"POST","path":"/v1/redact","status":200,"duration_ms":406,"pages":1,"detections":{"email+known_email":1,"social":1},"llm_calls":1,"model_ms":34}
+```
+
+No document text and no contact value is ever logged.
+
+One thing to know before relying on it: if the visible text of a link is the candidate's name and the link goes to their LinkedIn, `redact-identifying` hides the name along with the link, even though `name` is not a target.
+
 ## Development
 
 ```
 npm install
 npm test        # compiles to dist-test, then runs the suite against that
 npm run typecheck
+docker build -t rsredact .
 ```
 
 The tests generate their own fixture CV, including a hyperlink whose anchor text hides the URL, and assert on both the detections and the pixels. No network and no API key needed.

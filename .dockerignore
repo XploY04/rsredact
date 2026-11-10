@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-test/
+.git/
+.github/
+.gstack/
+assets/
+examples/
+test/
+*.md
+.env
+.env.*

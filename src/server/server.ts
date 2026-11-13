@@ -14,7 +14,7 @@ export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 /** Room for the multipart boundaries and the `known` field on top of the file. */
 const MAX_BODY_BYTES = MAX_FILE_BYTES + 1024 * 1024;
 
-const BASE_TARGETS: TargetInput[] = ['email', 'phone', 'social', 'url', HANDLE];
+const BASE_TARGETS: TargetInput[] = ['name', 'email', 'phone', 'social', 'url', HANDLE];
 
 const BASE_OPTIONS = {
   mode: 'text',

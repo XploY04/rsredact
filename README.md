@@ -359,15 +359,16 @@ curl -X POST http://localhost:8080/v1/redact \
 | `/v1/redact` | POST | Redact one PDF. Multipart form: `file` (the PDF, up to 25 MiB) and optional `known`. |
 | `/healthz` | GET | Returns `ok`. Never needs a token and is not logged. |
 
-What it runs: `mode: 'text'` with the OpenAI provider, `opaqueContent: 'vision'`, `style: 'box'`, `linkText: 'redact-identifying'`, `maxPages: 20`, OCR off. The targets are `email`, `phone`, `social`, `url` and a `handle` target for `@someone`. `name` is not a target, so the candidate's name stays readable. A page with an image, form field or annotation costs a second model call; see [Content the text layer cannot read](#content-the-text-layer-cannot-read).
+What it runs: `mode: 'text'` with the OpenAI provider, `opaqueContent: 'vision'`, `style: 'box'`, `linkText: 'redact-identifying'`, `maxPages: 20`, OCR off. The targets are `name`, `email`, `phone`, `social`, `url` and a `handle` target for `@someone`. `name` is not a target, so the candidate's name stays readable. A page with an image, form field or annotation costs a second model call; see [Content the text layer cannot read](#content-the-text-layer-cannot-read).
 
 The `handle` target skips what only looks like one: Java and TypeScript annotations (`@Transactional`, `@Injectable`), Python decorators, CSS at-rules, and npm scopes (`@ngrx/store`). The `url` target skips framework and degree names spelled like domains (`ASP.NET`, `Socket.IO`, `B.Tech`).
 
-`known` is the contact details you already hold for the candidate, as JSON with optional `emails`, `phones` and `urls` arrays (up to 20 strings each). A value that cannot be what it claims is dropped rather than refused: an email needs an `@` with a dot after it, a phone needs 8 digits, and a URL needs a dot. That keeps a placeholder like `"na"` or `"-"` from becoming a pattern that wipes ordinary text. Each value left becomes an exact-match pattern on top of the built-in ones:
+`known` is what you already hold for the candidate, as JSON with optional `emails`, `phones`, `urls` and `names` arrays (up to 20 strings each). A value that cannot be what it claims is dropped rather than refused: an email needs an `@` with a dot after it, a phone needs 8 digits, and a URL needs a dot. That keeps a placeholder like `"na"` or `"-"` from becoming a pattern that wipes ordinary text. Each value left becomes an exact-match pattern on top of the built-in ones:
 
 - an email matches regardless of case;
 - a phone matches its digits with optional spaces or dashes between them and an optional `+91` in front, so `+919876543210` also catches `98765 43210`;
 - a URL matches with or without its scheme and `www.`, but not with more path after it, so a profile URL does not hide links to its own repositories.
+- a name matches in full in any case and either order (`Jane Doe`, `DOE, JANE`), and each word of four or more letters matches on its own when capitalised or in capitals. A lowercase word or a shorter one is left alone, so a candidate called Dev or Mark does not blank ordinary text.
 
 A LinkedIn or GitHub URL also matches the pieces of its slug that a line wrap leaves behind. A wrap splits `jane-doe-1a2b` before a dash, leaving `-doe-1a2b`, or after one, leaving `doe-1a2b` at the start of the next line. The rules exist to keep the name readable, including hyphenated ones:
 

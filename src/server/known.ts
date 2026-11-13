@@ -1,10 +1,11 @@
 import type { CustomTarget } from '../types.js';
 
-/** Contact values the caller already holds for the candidate. */
+/** Identifying values the caller already holds for the candidate. */
 export interface KnownValues {
   emails: string[];
   phones: string[];
   urls: string[];
+  names: string[];
 }
 
 const MAX_VALUES_PER_KIND = 20;
@@ -16,6 +17,9 @@ const MIN_SUFFIX_LENGTH = 6;
 const MIN_PLAIN_SLUG_LENGTH = 8;
 const MIN_SLUG_LENGTH = 5;
 const MIN_PHONE_DIGITS = 8;
+/** A name word shorter than this is only matched as part of the full name. */
+const MIN_NAME_WORD_LENGTH = 4;
+const HONORIFICS = new Set(['dr', 'mr', 'mrs', 'ms', 'miss', 'prof', 'shri', 'smt']);
 
 const VALID_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -23,7 +27,7 @@ export class KnownValuesError extends Error {}
 
 /** Parses the `known` form field. An absent field means nothing is known. */
 export function parseKnown(raw: string | null): KnownValues {
-  const known: KnownValues = { emails: [], phones: [], urls: [] };
+  const known: KnownValues = { emails: [], phones: [], urls: [], names: [] };
   if (raw === null || raw.trim() === '') return known;
 
   let parsed: unknown;
@@ -36,7 +40,7 @@ export function parseKnown(raw: string | null): KnownValues {
     throw new KnownValuesError('known must be a JSON object');
   }
 
-  for (const kind of ['emails', 'phones', 'urls'] as const) {
+  for (const kind of ['emails', 'phones', 'urls', 'names'] as const) {
     const values = (parsed as Record<string, unknown>)[kind];
     if (values === undefined || values === null) continue;
     if (!Array.isArray(values) || values.some((v) => typeof v !== 'string')) {
@@ -61,6 +65,7 @@ export function parseKnown(raw: string | null): KnownValues {
 function isUsable(kind: keyof KnownValues, value: string): boolean {
   if (kind === 'emails') return VALID_EMAIL.test(value);
   if (kind === 'phones') return value.replace(/\D/g, '').length >= MIN_PHONE_DIGITS;
+  if (kind === 'names') return nameWords(value).some((word) => word.length >= 2);
   return urlCore(value).includes('.');
 }
 
@@ -99,7 +104,53 @@ export function buildKnownTargets(known: KnownValues): CustomTarget[] {
       patterns: urls,
     });
   }
+
+  const names = known.names.flatMap(namePatterns);
+  if (names.length > 0) {
+    targets.push({
+      id: 'known_name',
+      description: "The candidate's own name as the platform holds it.",
+      patterns: names,
+    });
+  }
   return targets;
+}
+
+/** The words of a name, without punctuation or a leading title such as "Dr.". */
+function nameWords(name: string): string[] {
+  return name
+    .split(/[\s.,]+/)
+    .map((word) => word.replace(/[^\p{L}'-]/gu, ''))
+    .filter((word) => word.length > 0 && !HONORIFICS.has(word.toLowerCase()));
+}
+
+/**
+ * The full name in either order, in any case, and each of its longer words
+ * when written as a name: capitalised or in capitals. A lowercase "mark" or a
+ * three-letter "Dev" on its own is left alone, because those are ordinary
+ * words far more often than they are the candidate.
+ */
+function namePatterns(name: string): RegExp[] {
+  const words = nameWords(name);
+  if (words.length === 0) return [];
+  const patterns: RegExp[] = [];
+  const before = '(?<![\\p{L}])';
+  const after = '(?![\\p{L}])';
+  const gap = '[\\s.,]+';
+
+  if (words.length > 1) {
+    patterns.push(new RegExp(before + words.map(escapeRegExp).join(gap) + after, 'giu'));
+    const first = escapeRegExp(words[0]!);
+    const last = escapeRegExp(words[words.length - 1]!);
+    patterns.push(new RegExp(before + last + gap + first + after, 'giu'));
+  }
+  for (const word of words) {
+    if ([...word].length < MIN_NAME_WORD_LENGTH) continue;
+    const lower = word.toLowerCase();
+    const capitalised = lower.charAt(0).toUpperCase() + lower.slice(1);
+    patterns.push(new RegExp(`${before}(?:${escapeRegExp(capitalised)}|${escapeRegExp(word.toUpperCase())})${after}`, 'gu'));
+  }
+  return patterns;
 }
 
 /**
@@ -123,7 +174,8 @@ function phonePattern(phone: string): RegExp[] {
  *
  * A wrap splits "yash-singh-gour" either before a dash, leaving "-singh-gour",
  * or after one, leaving "singh-gour" at the start of the next line. Both are
- * matched. The rules keep the candidate's name readable:
+ * matched. The rules keep these from matching the name itself, which has its
+ * own target, so a slug piece never blanks an unrelated word:
  *
  * - A tail with a leading dash matches anywhere, but not straight after a
  *   letter, so "-jones" never matches inside "Smith-Jones".

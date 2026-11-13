@@ -141,13 +141,35 @@ test('known values that cannot be what they claim are dropped', () => {
       emails: ['na', 'someone@localhost', 'jane@example.com'],
       phones: ['-', '1234567', '+91 98765 43210'],
       urls: ['na', '-', 'linkedin', 'janedoe.dev'],
+      names: ['-', 'Dr.', 'Jane Doe'],
     }),
   );
   assert.deepEqual(known, {
     emails: ['jane@example.com'],
     phones: ['+91 98765 43210'],
     urls: ['janedoe.dev'],
+    names: ['Jane Doe'],
   });
+});
+
+test('known name matches the full name in any case and order, and its longer words written as a name', () => {
+  const targets = knownTargets({ names: ['Dr. Yash Agarwal'] });
+  for (const text of ['YASH AGARWAL', 'Yash Agarwal', 'yash agarwal', 'Agarwal, Yash', 'Resume of Yash', "Agarwal's portfolio", 'Y A S H'.replace(/ /g, '')]) {
+    assert.ok(matchesAny(targets, text), `missed ${text}`);
+  }
+  // A lowercase word, part of a longer word, or the title alone is not the name.
+  for (const text of ['agarwalla traders', 'Yashwant Rao', 'Dr. Mehta']) {
+    assert.ok(!matchesAny(targets, text), `matched ${text}`);
+  }
+});
+
+test('a short or ordinary name word is only matched inside the full name', () => {
+  const targets = knownTargets({ names: ['Dev Mark'] });
+  assert.ok(matchesAny(targets, 'DEV MARK'));
+  assert.ok(matchesAny(targets, 'Mark, Dev'));
+  assert.ok(!matchesAny(targets, 'Dev team lead for the dev tools group'), 'a three-letter word matched on its own');
+  assert.ok(!matchesAny(targets, 'helped mark the release'), 'a lowercase word matched');
+  assert.ok(matchesAny(targets, 'Reported to Mark'), 'the capitalised word is treated as the name');
 });
 
 test('handles are matched, annotations and package scopes are not', () => {
@@ -160,7 +182,7 @@ test('handles are matched, annotations and package scopes are not', () => {
 });
 
 test('known rejects malformed input and accepts an absent field', () => {
-  assert.deepEqual(parseKnown(null), { emails: [], phones: [], urls: [] });
+  assert.deepEqual(parseKnown(null), { emails: [], phones: [], urls: [], names: [] });
   assert.throws(() => parseKnown('{not json'), KnownValuesError);
   assert.throws(() => parseKnown('[]'), KnownValuesError);
   assert.throws(() => parseKnown(JSON.stringify({ emails: 'a@b.com' })), KnownValuesError);
@@ -239,7 +261,7 @@ test('redacts the fixture CV, keeps the name, and reports what it did', async ()
   }
 });
 
-test('the name stays out of the model targets', async () => {
+test('the name is one of the model targets', async () => {
   const prompts: string[] = [];
   const server = await startServer({
     provider: customProvider({
@@ -256,7 +278,7 @@ test('the name stays out of the model targets', async () => {
     assert.equal(res.status, 200);
     await res.arrayBuffer();
     assert.equal(prompts.length, 1);
-    assert.doesNotMatch(prompts[0]!, /^- name:/m);
+    assert.match(prompts[0]!, /^- name:/m);
     assert.match(prompts[0]!, /^- handle:/m);
   } finally {
     await server.close();
@@ -455,7 +477,7 @@ test('the model can only name requested targets, and nothing it says reaches log
 
     const target = (requests[0]!.schema.schema as { properties: { redactions: { items: { properties: { target: { enum?: string[] } } } } } })
       .properties.redactions.items.properties.target;
-    assert.deepEqual(target.enum, ['email', 'phone', 'social', 'url', 'handle']);
+    assert.deepEqual(target.enum, ['name', 'email', 'phone', 'social', 'url', 'handle']);
   } finally {
     await server.close();
   }

@@ -1,13 +1,14 @@
 import type { Detection, Page, ResolvedTarget } from '../types.js';
 import { buildLines, unionBox, wordsInRange, type LineText } from './lines.js';
 import { URL_TEXT_PATTERNS } from './urls.js';
+import { addressGuard, type Neighbours } from './address.js';
 
 /**
  * Regexes alone are too eager for some targets. A phone pattern will happily
  * eat "2019 - 2021" out of an experience section, and blacking out every date
  * range makes a CV useless. Guards run after the match and veto it.
  */
-const GUARDS: Record<string, (match: string, line: string, index: number) => boolean> = {
+const GUARDS: Record<string, (match: string, line: string, index: number, neighbours: Neighbours) => boolean> = {
   phone: (match, line, index) => {
     const digits = match.replace(/\D/g, '');
     if (digits.length < 7 || digits.length > 15) return false;
@@ -25,6 +26,7 @@ const GUARDS: Record<string, (match: string, line: string, index: number) => boo
     return labelled || international || digits.length >= 9;
   },
   dob: (match) => match.trim().length > 3,
+  address: addressGuard,
 };
 
 /** Targets whose patterns must never fire on characters inside a URL. */
@@ -38,7 +40,7 @@ export function detectPatterns(page: Page, targets: ResolvedTarget[]): Detection
   for (const target of targets) {
     if (target.patterns.length === 0) continue;
 
-    for (const line of lines) {
+    for (const [position, line] of lines.entries()) {
       for (const pattern of target.patterns) {
         const regex = new RegExp(pattern.source, ensureGlobal(pattern.flags));
         for (const match of line.text.matchAll(regex)) {
@@ -47,7 +49,8 @@ export function detectPatterns(page: Page, targets: ResolvedTarget[]): Detection
           const index = match.index ?? 0;
 
           const guard = GUARDS[target.id];
-          if (guard && !guard(raw, line.text, index)) continue;
+          const neighbours = { previous: lines[position - 1]?.text, next: lines[position + 1]?.text };
+          if (guard && !guard(raw, line.text, index, neighbours)) continue;
 
           // A URL is full of digits that look like phone numbers: LinkedIn
           // activity ids and Credly badge UUIDs both match. The URL itself is

@@ -5,8 +5,10 @@ import test from 'node:test';
 import { createCanvas } from '@napi-rs/canvas';
 import { PDFDocument } from 'pdf-lib';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { redact } from '../src/index.js';
 import { customProvider } from '../src/providers/index.js';
 import { openaiProvider } from '../src/providers/openai.js';
+import { ADDRESS } from '../src/server/address.js';
 import { HANDLE } from '../src/server/handle.js';
 import { buildKnownTargets, KnownValuesError, parseKnown } from '../src/server/known.js';
 import { createRedactServer, MAX_FILE_BYTES, type ServerOptions } from '../src/server/server.js';
@@ -181,6 +183,55 @@ test('handles are matched, annotations and package scopes are not', () => {
   assert.deepEqual(handle('Twitter: @priya_r, mail priya@example.com'), ['@priya_r']);
 });
 
+/** The text the address target redacts on a page with these lines under the name, top to bottom. */
+async function addressHits(lines: string[]): Promise<string[]> {
+  const pdf = await buildPdf((canvas) => {
+    lines.forEach((text, i) => canvas.page.drawText(text, { x: 60, y: 700 - i * 14, size: 10, font: canvas.helvetica }));
+  });
+  const result = await redact(pdf, { targets: [ADDRESS], mode: 'patterns-only' });
+  return result.detections.map((d) => d.text ?? '');
+}
+
+test('an address block loses its street, locality and PIN, and keeps the city', async () => {
+  assert.deepEqual(
+    await addressHits(['No. 42, 3rd Cross, 5th Main', 'HSR Layout, Sector 2', 'Bengaluru - 560102', 'Senior Backend Engineer']),
+    ['No. 42, 3rd Cross, 5th Main', 'HSR Layout, Sector 2', '560102'],
+  );
+  assert.deepEqual(
+    await addressHits(['#123, 4th Cross, 2nd Main', 'Koramangala 5th Block', 'Bengaluru, Karnataka 560095']),
+    ['#123, 4th Cross, 2nd Main', 'Koramangala 5th Block', '560095'],
+  );
+  // A locality with no street word counts only between two lines of the address.
+  assert.deepEqual(
+    await addressHits(['Flat 302, Sunshine Apartments', 'Whitefield', 'Bengaluru 560066']),
+    ['Flat 302, Sunshine Apartments', 'Whitefield', '560066'],
+  );
+});
+
+test('an address on one line keeps its label, city, state and country', async () => {
+  assert.deepEqual(
+    await addressHits(['Address: H.No. 4-5-67, 12th Main Road, Indiranagar, Bengaluru, Karnataka 560038, India']),
+    ['H.No. 4-5-67, 12th Main Road, Indiranagar', '560038'],
+  );
+  assert.deepEqual(await addressHits(['Mysuru, Karnataka | PIN: 570017']), ['570017']);
+});
+
+test('a city, an employer location and figures in the body are not an address', async () => {
+  assert.deepEqual(
+    await addressHits([
+      'Bengaluru, India',
+      'Senior Engineer, Acme Payments, Bengaluru, India 2019 - 2024',
+      'Analyst, Main Street Capital, Mumbai, India',
+      'Served 250000 users across 12 cities in India',
+      'Ranked #1 in the Main track of a national hackathon',
+      'Built the Main Block Storage layer with CSS Grid Layout',
+      'Current CTC 950000',
+      'Mobile: +91 987 654 3210',
+    ]),
+    [],
+  );
+});
+
 test('known rejects malformed input and accepts an absent field', () => {
   assert.deepEqual(parseKnown(null), { emails: [], phones: [], urls: [], names: [] });
   assert.throws(() => parseKnown('{not json'), KnownValuesError);
@@ -280,6 +331,20 @@ test('the name is one of the model targets', async () => {
     assert.equal(prompts.length, 1);
     assert.match(prompts[0]!, /^- name:/m);
     assert.match(prompts[0]!, /^- handle:/m);
+  } finally {
+    await server.close();
+  }
+});
+
+test('the server redacts the address and reports it', async () => {
+  const server = await startServer();
+  const { bytes } = await buildSampleCv({ extraLine: 'No. 42, 3rd Cross, HSR Layout, Bengaluru 560102' });
+  try {
+    const res = await redactCall(server.url, bytes);
+    assert.equal(res.status, 200, await res.clone().text());
+    await res.arrayBuffer();
+    const counts = JSON.parse(res.headers.get('x-rsredact-detections') ?? '{}') as Record<string, number>;
+    assert.equal(counts.address, 2, JSON.stringify(counts));
   } finally {
     await server.close();
   }
@@ -477,7 +542,7 @@ test('the model can only name requested targets, and nothing it says reaches log
 
     const target = (requests[0]!.schema.schema as { properties: { redactions: { items: { properties: { target: { enum?: string[] } } } } } })
       .properties.redactions.items.properties.target;
-    assert.deepEqual(target.enum, ['name', 'email', 'phone', 'social', 'url', 'handle']);
+    assert.deepEqual(target.enum, ['name', 'email', 'phone', 'social', 'url', 'handle', 'address']);
   } finally {
     await server.close();
   }
